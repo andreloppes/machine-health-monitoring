@@ -14,8 +14,9 @@
 #define QOS 1
 #define BROKER_ADDRESS "tcp://localhost:1883"
 
+// Function to calculate CPU percentage
 double cpu_percentage(){
-     std::ifstream stat_file("/proc/stat");
+    std::ifstream stat_file("/proc/stat");
     std::string line;
     
     // Read the first line of /proc/stat to get the CPU usage information
@@ -49,21 +50,32 @@ double cpu_percentage(){
     return cpu_percentage;
 }
 
-double cpu_temperature(){
-    std::ifstream temp_file("/proc/acpi/thermal_zone/THRM/temperature");
-    if (!temp_file) {
-        std::cerr << "Failed to open temperature file." << std::endl;
-        return 1;
-    }
+// Function to publish CPU usage to MQTT broker
+void publishToMqttCPU(mqtt::client& client, nlohmann::json j, std::string machineId, int freq) {
+ while(true){
+  // Get the current time in ISO 8601 format.
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+        std::tm* now_tm = std::localtime(&now_c);
+        std::stringstream ss;
+        ss << std::put_time(now_tm, "%FT%TZ");
+        std::string timestamp = ss.str();
 
-    int temperature;
-    temp_file >> temperature;
+        double cpu_used = cpu_percentage(); // Monitors CPU usage percentage
 
-    // Convert millidegrees Celsius to degrees Celsius
-    double celsius = static_cast<double>(temperature) / 1000;
-    return celsius;
+
+        // Publish the JSON message to the appropriate topic.
+        std::string topic_cpuused = "/sensors/" + machineId + "/cpuused"; 
+        mqtt::message msg_cpu(topic_cpuused, j.dump(), QOS, false);
+        j["timestamp"] = timestamp;
+        j["value"] = cpu_used;
+        client.publish(msg_cpu);
+        std::clog << "message published - topic: " << topic_cpuused << " - message: " << j.dump() << std::endl;    
+        std::this_thread::sleep_for(std::chrono::seconds(freq-1));      
+ }
 }
 
+// Function to calculate memory usage percentage
 double memory_used(){
      std::ifstream meminfo_file("/proc/meminfo");
     if (!meminfo_file) {
@@ -75,18 +87,24 @@ double memory_used(){
     std::string mem_total_str;
     std::string mem_available_str;
 
+    // Read each line of the /proc/meminfo file
     while (std::getline(meminfo_file, line)) {
         std::istringstream iss(line);
         std::string key;
         std::string value;
         iss >> key >> value;
 
+        // Check if the line contains "MemTotal:" or "MemAvailable:"
+        // If it does, store the corresponding value in the respective variables
         if (key == "MemTotal:") {
             mem_total_str = value;
         } else if (key == "MemAvailable:") {
             mem_available_str = value;
         }
 
+        // If both mem_total_str and mem_available_str are not empty,
+        // it means we have retrieved the required memory information
+        // Break out of the loop to stop reading further lines
         if (!mem_total_str.empty() && !mem_available_str.empty()) {
             break;
         }
@@ -97,62 +115,75 @@ double memory_used(){
         return -1;
     }
 
+    // Convert the retrieved memory values from string to double
     double mem_total = std::stod(mem_total_str);
     double mem_available = std::stod(mem_available_str);
 
+    // Calculate the memory usage percentage by subtracting available memory from total memory,
+    // dividing by total memory, and multiplying by 100
     double mem_usage_percentage = (mem_total - mem_available) / mem_total * 100.0;
 
     return mem_usage_percentage;
 }
 
-double io_performance(){
-    // Command to measure I/O performance using dd
-    const char* command = "dd if=/dev/zero of=tempfile bs=1M count=1024 conv=fdatasync";
+// Function to publish memory usage to MQTT broker
+void publishToMqttMEM(mqtt::client& client, nlohmann::json j, std::string machineId, int freq) {
+ while(true){
+  // Get the current time in ISO 8601 format.
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+        std::tm* now_tm = std::localtime(&now_c);
+        std::stringstream ss;
+        ss << std::put_time(now_tm, "%FT%TZ");
+        std::string timestamp = ss.str();
 
-    // Create a pipe to capture the output of the command
-    FILE* pipe = popen(command, "r");
-    if (!pipe) {
-        std::cerr << "Failed to open pipe for command execution." << std::endl;
-        return -1;
-    }
+        double mem_used = memory_used(); // Monitors CPU usage percentage
 
-    // Read the output of the command
-    const int max_buffer = 256;
-    char buffer[max_buffer];
-    std::string output;
-    while (!feof(pipe)) {
-        if (fgets(buffer, max_buffer, pipe) != nullptr)
-            output += buffer;
-    }
-    pclose(pipe);
 
-    // Parse the output to extract the relevant information
-    const char* throughput_str = "copied, ";
-    const char* speed_unit_str = " in ";
-    const char* speed_end_str = "/s";
-    std::size_t throughput_pos = output.find(throughput_str);
-    std::size_t speed_unit_pos = output.find(speed_unit_str, throughput_pos + 1);
-    std::size_t speed_end_pos = output.find(speed_end_str, speed_unit_pos + 1);
+        std::string topic_memused = "/sensors/" + machineId + "/memused";
+        mqtt::message msg_mem(topic_memused, j.dump(), QOS, false);
+        j["timestamp"] = timestamp;
+        j["value"] = mem_used;
+        client.publish(msg_mem);
+        std::clog << "message published - topic: " << topic_memused << " - message: " << j.dump() << std::endl;
+        
 
-    if (throughput_pos == std::string::npos || speed_unit_pos == std::string::npos || speed_end_pos == std::string::npos) {
-        std::cerr << "Failed to parse output for I/O performance measurement." << std::endl;
-        return -1;
-    }
+        std::this_thread::sleep_for(std::chrono::seconds(freq));    
+ }
+}
 
-    std::string throughput_substr = output.substr(throughput_pos + strlen(throughput_str), speed_unit_pos - throughput_pos - strlen(throughput_str));
-    std::string speed_unit_substr = output.substr(speed_unit_pos + strlen(speed_unit_str), speed_end_pos - speed_unit_pos - strlen(speed_unit_str));
+// Function to create the JSON payload
+nlohmann::json createJsonPayload(const std::string& machineId, const std::vector<nlohmann::json>& sensors) {
+    nlohmann::json payload;
+    payload["machine_id"] = machineId;
+    payload["sensors"] = sensors;
+    return payload;
+}
 
-    double throughput = std::stod(throughput_substr);
-    std::string speed_unit = speed_unit_substr;
+// Function to publish sensor monitors to MQTT broker
+void publishToMqttINMSG(mqtt::client& client, nlohmann::json j, std::string machineId, int freqcpu, int freqmem, int freq) {
+ while(true){
+        std::vector<nlohmann::json> sensors;
+        std::string sensor_monitors = "/sensor_monitors";
+        mqtt::message msg_mem(sensor_monitors, j.dump(), QOS, false);
+        j["machine_id"] = machineId;
+        nlohmann::json sensor1, sensor2;
+        sensor1["sensor_id"] = {"memused"};
+        sensor1["data_type"] = {"double"};
+        sensor1["data_interval"] = {std::to_string(freqmem)};
+        sensors.push_back(sensor1);  
+        
+        sensor2["sensor_id"] = {"cpuused"};
+        sensor2["data_type"] = {"double"};
+        sensor2["data_interval"] = {std::to_string(freqcpu)};
+        sensors.push_back(sensor2);
 
-    // Convert throughput to bytes/s if necessary
-    if (speed_unit == "MB") {
-        throughput *= 1024 * 1024;
-    } else if (speed_unit == "KB") {
-        throughput *= 1024;
-    }
-
-    return throughput;
+        nlohmann::json payload = createJsonPayload(machineId, sensors);
+        client.publish(msg_mem);
+        std::clog << "message published - topic: " << sensor_monitors << " - message: " << payload.dump() << std::endl;
+        
+        std::this_thread::sleep_for(std::chrono::seconds(freq));    
+ }
 }
 
 int main(int argc, char* argv[]) {
@@ -176,62 +207,31 @@ int main(int argc, char* argv[]) {
     char hostname[1024];
     gethostname(hostname, 1024);
     std::string machineId(hostname);
-
-    while (true) {
-       // Get the current time in ISO 8601 format.
-        auto now = std::chrono::system_clock::now();
-        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-        std::tm* now_tm = std::localtime(&now_c);
-        std::stringstream ss;
-        ss << std::put_time(now_tm, "%FT%TZ");
-        std::string timestamp = ss.str();
-
-       // double value = cpu_percentage();
-
-        //int value = rand();
-        double cpu_used = cpu_percentage(); // Monitors CPU usage percentage
-        double mem_used = memory_used(); // Monitors de total memory used 
-        double io_perf = io_performance(); // Monitors disk I/O performance
-        double cpu_temp = cpu_temperature(); // Monitors CPU temperatrue;
-
-        
-
         // Construct the JSON message.
         nlohmann::json j;
+        int cpufreq, memfreq, msgfreq;
+    std::clog << "Enter the CPU reading frequency (s): ";
+    std::cin >> cpufreq;
+    std::clog << std::endl;
+    std::clog << "Enter the MEMORY reading frequency (s): ";
+    std::cin >> memfreq;
+    std::clog << std::endl;
+    std::clog << "Enter the sensors message frequency (s): ";
+    std::cin >> msgfreq;
+    std::clog << std::endl;
 
+    // Start the status message thread
+    std::thread inMessafe(publishToMqttINMSG, std::ref(client), j, machineId, cpufreq, memfreq, msgfreq);
 
-        // Publish the JSON message to the appropriate topic.
-        std::string topic_cpuused = "/sensors/" + machineId + "/cpuused"; 
-        mqtt::message msg_cpu(topic_cpuused, j.dump(), QOS, false);
-        j["timestamp"] = timestamp;
-        j["value"] = cpu_used;
-        client.publish(msg_cpu);
-        std::clog << "message published - topic: " << topic_cpuused << " - message: " << j.dump() << std::endl;        
+    // Start the CPU thread
+    std::thread cpuThread(publishToMqttCPU, std::ref(client), j, machineId, cpufreq); 
 
-        std::string topic_memused = "/sensors/" + machineId + "/memused";
-        mqtt::message msg_mem(topic_memused, j.dump(), QOS, false);
-        j["timestamp"] = timestamp;
-        j["value"] = mem_used;
-        client.publish(msg_mem);
-        std::clog << "message published - topic: " << topic_memused << " - message: " << j.dump() << std::endl;
-        
-        std::string topic_ioperf = "/sensors/" + machineId + "/ioperf";
-        mqtt::message msg_io(topic_ioperf, j.dump(), QOS, false);
-        std::clog << "message published - topic: " << topic_ioperf << " - message: " << j.dump() << std::endl;
-        j["timestamp"] = timestamp;
-        j["value"] = io_perf;
-        client.publish(msg_io);
+    // Start the memory thread
+    std::thread memoryThread(publishToMqttMEM, std::ref(client), j, machineId, memfreq); 
 
-        std::string topic_cputemp = "/sensors/" + machineId + "/cputemp";
-        mqtt::message msg_temp(topic_cputemp, j.dump(), QOS, false);
-        std::clog << "message published - topic: " << topic_cputemp << " - message: " << j.dump() << std::endl;
-        j["timestamp"] = timestamp;
-        j["value"] = cpu_temp;
-        client.publish(msg_temp);
-
-        // Sleep for some time.
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
+    inMessafe.join();
+    cpuThread.join();
+    memoryThread.join();
 
     return EXIT_SUCCESS;
 }
